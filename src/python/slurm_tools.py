@@ -87,7 +87,124 @@ class Job:
          self.qos = qos
       else:
          print 'Problem setting QOS for job %d: %s' % (self.id, outStr)
-      
+
+
+class JobToRun:
+
+    def __init__(self):
+        self.cmds = None
+        self.params = None
+        self.completion_file = None
+        self.running = False
+        self.start_times = 0
+        self.completed = False
+        self.job_id = -1
+
+
+class SlurmBot:
+
+    def __init__(self):
+        self.jobs = []
+        self.poll_interval = 37.0
+        self.max_jobs = 10
+
+
+    def add(self, cmdStrs, sbatchParams, completion_fileName = None):
+        sj = JobToRun()
+        sj.cmds = cmdStrs
+        sj.params = sbatchParams
+        sj.completion_file = completion_fileName
+        self.jobs.append(sj)
+
+
+    def clear(self):
+        del self.jobs[0:len(self.jobs)]
+
+
+    def get_queued_jobs(self):
+        return filter(lambda sj: not sj.completed and not(sj.running), self.jobs)
+
+
+    def get_running_jobs(self):
+        return filter(lambda sj: sj.running and not(sj.completed), self.jobs)
+
+
+    def get_uncompleted_jobs(self):
+        ujList = []
+        for sj in self.jobs:
+            if not sj.completed or not os.path.exists(sj.completion_file):
+                ujList.append(sj)
+        return ujList
+
+    def mark_completed_jobs(self):
+        for sj in self.jobs:
+            if sj.completion_file != None and os.path.exists(sj.completion_file):
+                sj.completed = True
+
+    def update_running_jobs(self):
+
+        jobInfo = slurm_squeue()
+        for rj in self.get_running_jobs():
+            jinfo = filter(lambda j: j['ID'] == rj.job_id, jobInfo)
+            if len(jinfo) == 0:
+                rj.running = False
+                if rj.completion_file is None:
+                    print 'Marking job %d as completed (no completion file specified)' % rj.job_id
+                    rj.completed = True
+                elif rj.completion_file != None and os.path.exists(rj.completion_file):
+                    print 'Marking job %d as completed' % rj.job_id
+                    rj.completed = True
+
+
+    def run_and_wait(self, ignoreCompleted = False):
+
+        if not ignoreCompleted:
+            self.mark_completed_jobs()
+            uj = self.get_uncompleted_jobs()
+            nComp = len(self.jobs) - len(uj)
+            print 'Marked %d jobs as already completed' % nComp
+
+        self.update_running_jobs()
+        queuedJobs = self.get_queued_jobs()
+        runningJobs = self.get_running_jobs()
+
+        while len(queuedJobs) > 0 or len(runningJobs) > 0:
+
+            self.update_running_jobs()
+
+            queuedJobs = self.get_queued_jobs()
+            runningJobs = self.get_running_jobs()
+
+            print '# of queued jobs: %d' % len(queuedJobs)
+            print '# of running jobs: %d' % len(runningJobs)
+
+            nJobsAvailable = min(len(queuedJobs), self.max_jobs - len(runningJobs))
+            print '# of available job space to run: %d' % nJobsAvailable
+            if nJobsAvailable > 0 and len(queuedJobs) > 0:
+
+                for k in range(nJobsAvailable):
+                    #Run jobs
+                    sj = queuedJobs[k]
+                    job_id = slurm_sbatch(sj.cmds, **sj.params)
+                    sj.running = True
+                    sj.job_id = job_id
+                    if sj.start_times == 0:
+                        print 'Started job with id %d' % job_id
+                    else:
+                        print 'Restarted job with id %d' % job_id
+                    sj.start_times += 1
+
+            time.sleep(self.poll_interval)
+
+
+    def run(self):
+
+        for sj in self.get_queued_jobs():
+            cmdStrs = sj.cmds
+            slurmParams = sj.params
+            job_id = slurm_sbatch(cmdStrs, **slurmParams)
+            sj.job_id = job_id
+            print 'Started job with id %d' % job_id
 
 
 
@@ -218,3 +335,185 @@ def get_job_info():
             jobs.append(j)
 
     return jobs
+
+def slurm_squeue(**keywords):
+
+    sqcmd = ['squeue', '-h', '-o', '%N %P %Q %u %M %T %i %C']
+    if 'username' in keywords:
+        sqcmd.append('-u')
+        sqcmd.append(keywords['username'])
+
+    proc = subprocess.Popen(sqcmd, stdout=subprocess.PIPE)
+    outStr = proc.communicate()[0]
+
+    jobsInfo = []
+    for l in string.split(outStr, '\n'):
+        if len(l) > 0:
+            jstr = string.split(l)
+            if len(jstr) < 8:
+                jstr.insert(0, 'None')
+            jinfo = {}
+            jinfo['NODELIST'] = jstr[0]
+            jinfo['PARTITION'] = jstr[1]
+            jinfo['PRIORITY'] = int(jstr[2])
+            jinfo['USER'] = jstr[3]
+            jinfo['TIME'] = jstr[4]
+            jinfo['STATE'] = jstr[5]
+            jinfo['ID'] = int(jstr[6])
+            jinfo['CPUS'] = int(jstr[7])
+            jobsInfo.append(jinfo)
+
+    return jobsInfo
+
+
+def slurm_sbatch(cmdList, **sbatchParams):
+    """Run a command using sbatch, returning the job id.
+
+    Keyword arguments:
+    partition -- the name of the partition to run on
+    depends -- a comma-separated list of job id dependencies
+    out -- file path to write stdout to
+    err -- file path to write stderr to
+    nodes -- the # of nodes this job will require
+    qos -- the quality-of-service for this job
+    cpus -- the # of CPUs required by this job
+    script -- the name of the script file that will be written, defaults to a temporary file
+
+    Returns the job id.
+    """
+
+    sbatchCmds = []
+    if 'partition' in sbatchParams:
+        sbatchCmds.append('-p')
+        sbatchCmds.append(sbatchParams['partition'])
+    if 'depends' in sbatchParams:
+        sbatchCmds.append('-d')
+        sbatchCmds.append(sbatchParams['depends'])
+    if 'out' in sbatchParams:
+        sbatchCmds.append('-o')
+        sbatchCmds.append(sbatchParams['out'])
+    if 'err' in sbatchParams:
+        sbatchCmds.append('-e')
+        sbatchCmds.append(sbatchParams['err'])
+    if 'nodes' in sbatchParams:
+        sbatchCmds.append('-N')
+        sbatchCmds.append('%d' % sbatchParams['nodes'])
+    if 'qos' in sbatchParams:
+        sbatchCmds.append('--qos=%d' % sbatchParams['qos'])
+    if 'cpus' in sbatchParams:
+        sbatchCmds.append('-c')
+        sbatchCmds.append('%d' % sbatchParams['cpus'])
+    if 'mem' in sbatchParams:
+        sbatchCmds.append('--mem')
+        sbatchCmds.append(sbatchParams['mem'])
+
+    #Create a temp batch script
+    if 'script' in sbatchParams:
+        ofname = sbatchParams['script']
+        ofd = open(ofname, 'w')
+    else:
+        (ofid, ofname) = tempfile.mkstemp(prefix='slurmtools_')
+        ofd = open(ofname, 'w')
+
+    #write the temp batch script
+    ofd.write('#!/bin/sh\n')
+    sbHeader = '#SBATCH %s\n' % ' '.join(sbatchCmds)
+    ofd.write(sbHeader)
+    ofd.write(' '.join(cmdList))
+    ofd.write('\n')
+    ofd.close()
+
+    jobId = slurm_sbatch_from_file(ofname)
+    return jobId
+
+
+def slurm_sbatch_from_file(fileName):
+
+    finalCmds = ['sbatch', '-v', fileName]
+
+    #run the sbatch process
+    proc = subprocess.Popen(finalCmds, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+    jobId = -1
+    attempts = 0
+    maxAttempts = 100
+    while attempts < maxAttempts:
+
+        time.sleep(0.1)
+
+        odata = proc.stdout.read()
+        m = re.search('batch\\sjob\\s\\d*', odata)
+        if m is not None:
+            mstr = m.group()
+            jobId = int(mstr.split()[2])
+            break
+
+        attempts += 1
+
+    return jobId
+
+
+
+def slurm_srun(cmdList, **srunParams):
+    """Run a command using srun, returning the job id.
+
+    Keyword arguments:
+    partition -- the name of the partition to run on
+    depends -- a comma-separated list of job id dependencies
+    out -- file path to write stdout to
+    err -- file path to write stderr to
+    nodes -- the # of nodes this job will require
+    qos -- the quality-of-service for this job
+    """
+
+    srunCmds = ['srun', '-v']
+    if 'partition' in srunParams:
+        srunCmds.append('-p')
+        srunCmds.append(srunParams['partition'])
+    if 'depends' in srunParams:
+        srunCmds.append('-d')
+        srunCmds.append(srunParams['depends'])
+    if 'out' in srunParams:
+        srunCmds.append('-o')
+        srunCmds.append(srunParams['out'])
+    if 'err' in srunParams:
+        srunCmds.append('-e')
+        srunCmds.append(srunParams['err'])
+    if 'nodes' in srunParams:
+        srunCmds.append('-N')
+        srunCmds.append(srunParams['nodes'])
+    if 'qos' in srunParams:
+        srunCmds.append('--qos=%d' % srunParams['qos'])
+
+    for c in cmdList:
+        srunCmds.append(c)
+
+    (ofid, ofname) = tempfile.mkstemp(prefix='slurmtools_')
+    proc = subprocess.Popen(srunCmds, stdout=ofid, stderr=ofid)
+
+    jobId = -1
+    attempts = 0
+    maxAttempts = 30
+    while attempts < maxAttempts:
+
+        time.sleep(0.5)
+
+        f = open(ofname)
+        odata = f.read()
+        f.close()
+
+        retCode = proc.poll()
+        if retCode is not None:
+            print 'srun may have failed, output below:'
+            print odata
+            return -1
+
+        m = re.search('jobid\\s\\d*', odata)
+        if m is not None:
+            mstr = m.group()
+            jobId = int(mstr.split()[1])
+            break
+
+        attempts += 1
+
+    return jobId
